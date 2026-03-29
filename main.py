@@ -8,7 +8,6 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import google.generativeai as genai
 import ollama
 import requests
 from pynostr.encrypted_dm import EncryptedDirectMessage
