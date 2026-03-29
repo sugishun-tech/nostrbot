@@ -46,7 +46,7 @@ def respond(message, theme=None, is_autonomous=False):
 
     cs = prompts.cs.split(",")
     response = ollama.chat(model=model, messages=messages)['message']['content']
-    for rmc in rmcs.split(","):
+    for rmc in prompts.rmcs.split(","):
         response = response.replace(rmc, "")
     response = '。'.join([x for x in response.split("。") if all(c not in x for c in cs)]).strip()
     return response
