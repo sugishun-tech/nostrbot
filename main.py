@@ -28,7 +28,9 @@ JST = timezone(timedelta(hours=+9))
 
 
 def system_message():
-    return prompts.system
+    cd = datetime.now(JST)
+    cds = cd.strftime("%I %p %A")
+    return prompts.system.format(cds=cds)
 
 
 def respond(message, theme=None, is_autonomous=False):
