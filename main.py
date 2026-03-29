@@ -1,158 +1,176 @@
 import gc
-import json
+import logging
 import os
-import random
 import re
-import ssl
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import ollama
-import requests
-from pynostr.encrypted_dm import EncryptedDirectMessage
 from pynostr.event import Event, EventKind
 from pynostr.filters import Filters, FiltersList
 from pynostr.key import PrivateKey
-from pynostr.message_type import ClientMessageType
 from pynostr.relay_manager import RelayManager
 from pynostr.utils import get_timestamp
 
 import prompts
 
-relay_manager = RelayManager(timeout=2)
-model = "hf.co/mmnga/Llama-3.1-Swallow-8B-Instruct-v0.5-gguf"
+# ログ設定
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-JST = timezone(timedelta(hours=+9))
+class NostrBot:
+    def __init__(self):
+        self.jst = timezone(timedelta(hours=+9))
+        self.model = "hf.co/mmnga/Llama-3.1-Swallow-8B-Instruct-v0.5-gguf"
+        self.post_interval = 3600  # 60分
+        self.last_post_time = 0
+        self.messages_done = set()
 
+        # 環境変数チェック
+        env_private_key = os.environ.get("PRIVATE_KEY")
+        if not env_private_key:
+            raise ValueError("PRIVATE_KEY is not set.")
 
-def system_message():
-    cd = datetime.now(JST)
-    cds = cd.strftime("%I %p %A")
-    return prompts.system.format(cds=cds)
+        self.private_key = PrivateKey.from_nsec(env_private_key)
+        self.pubkey_hex = self.private_key.public_key.hex()
 
+        relays = os.getenv('RELAYS', "wss://relay-jp.nostr.wirednet.jp/,wss://yabu.me/,wss://r.kojira.io/,wss://nrelay-jp.c-stellar.net/")
+        self.relay_urls = [r.strip() for r in relays.split(",") if r.strip()]
 
-def respond(message, theme=None, is_autonomous=False):
-    if is_autonomous:
-        prompt = prompts.prompt.format(theme=theme)
-    else:
-        # 返信用
-        prompt = message
-        print(prompt)
-    messages = [
-        {"role": "system", "content": system_message()},
-        {"role": "user", "content": prompt}
-    ]
+        self.relay_manager = RelayManager(timeout=2)
 
-    cs = prompts.cs.split(",")
-    response = ollama.chat(model=model, messages=messages)['message']['content']
-    for rmc in prompts.rmcs.split(","):
-        response = response.replace(rmc, "")
-    response = '。'.join([x for x in response.split("。") if all(c not in x for c in cs)]).strip()
-    return response
+    def get_system_message(self):
+        """現在の時刻を含めたシステムプロンプトを生成"""
+        now_str = datetime.now(self.jst).strftime("%I %p %A")
+        return prompts.system.format(cds=now_str)
 
+    def generate_response(self, content, theme=None, is_autonomous=False):
+        """AIによる応答生成とフィルタリング"""
+        prompt_text = prompts.prompt.format(theme=theme) if is_autonomous else content
 
-def run():
-    messages_done = []
-    # 初回起動時に即投稿したい場合は、ここを 0 に設定してください
-    last_post_time = 0
-    POST_INTERVAL = 3600  # 60分
+        messages = [
+            {"role": "system", "content": self.get_system_message()},
+            {"role": "user", "content": prompt_text}
+        ]
 
-    env_private_key = os.environ.get("PRIVATE_KEY")
-    if not env_private_key:
-        print('PRIVATE_KEY is not set.')
-        exit(1)
+        try:
+            response = ollama.chat(model=self.model, messages=messages)['message']['content']
 
-    private_key = PrivateKey.from_nsec(env_private_key)
-    env_relays = os.getenv('RELAYS') or "wss://relay-jp.nostr.wirednet.jp/,wss://yabu.me/,wss://r.kojira.io/,wss://nrelay-jp.c-stellar.net/"
+            # クリーニング処理
+            for rmc in prompts.rmcs.split(","):
+                response = response.replace(rmc, "")
 
-    for relay in env_relays.split(","):
-        relay_manager.add_relay(relay)
+            # 禁止ワードを含む一文を除去
+            cs = prompts.cs.split(",")
+            sentences = response.split("。")
+            filtered_sentences = [s for s in sentences if all(c not in s for c in cs)]
 
-    print(f"AI 稼働中... (Pubkey: {private_key.public_key.bech32()})")
-    start_timestamp = get_timestamp()
+            return "。".join(filtered_sentences).strip()
+        except Exception as e:
+            logger.error(f"AI生成エラー: {e}")
+            return "..."
 
-    while (True):
-        now = time.time()
-        now_jst = datetime.now(JST)
-        ch = now_jst.hour
-        wd = now_jst.weekday()
-        if wd == 4 and ch >= 15:
-            time.sleep(3600)
-            continue
-        if wd == 5:
-            time.sleep(3600)
-            continue
-        if ch >= 21 or ch < 6:
-            print("sleeping...zzz")
-            time.sleep(600)
-            continue
+    def is_sleep_time(self):
+        """稼働時間外（夜間や特定の曜日）か判定"""
+        now = datetime.now(self.jst)
+        hour = now.hour
+        weekday = now.weekday()
 
-        # --- 1. 自発的な定期投稿 ---
-        if now - last_post_time >= POST_INTERVAL:
-            print("定期投稿を送信中...")
-            random.seed(time.time())
-            themes = prompts.themes
-            theme = random.choice([t.strip() for t in themes.split(",") if t.strip()])
-            post_content = respond("", theme=theme, is_autonomous=True)
-            note = Event(content=post_content, kind=EventKind.TEXT_NOTE)
-            note.sign(private_key.hex())
+        # 金曜15時以降〜土曜終日は休み
+        if (weekday == 4 and hour >= 15) or (weekday == 5):
+            return True
+        # 夜間（21時〜翌6時）は休み
+        if hour >= 21 or hour < 6:
+            return True
+        return False
 
-            relay_manager.run_sync()
-            relay_manager.publish_event(note)
-            print(f"投稿完了: {post_content[:20]}...")
-            last_post_time = now
+    def setup_relays(self):
+        """リレーの初期化と購読設定"""
+        self.relay_manager.close_all_relay_connections()  # 一旦リセット
+        for url in self.relay_urls:
+            self.relay_manager.add_relay(url)
 
-        # --- 2. メンションへの反応 ---
-        # 自分宛のメッセージ（pubkey_refs）のみをフィルタリング
         filters = FiltersList([
-            Filters(pubkey_refs=[private_key.public_key.hex()],
+            Filters(pubkey_refs=[self.pubkey_hex],
                     kinds=[EventKind.TEXT_NOTE],
-                    since=start_timestamp)
+                    since=get_timestamp())
         ])
-
         subscription_id = uuid.uuid1().hex
-        relay_manager.add_subscription_on_all_relays(subscription_id, filters)
-        relay_manager.run_sync()
+        self.relay_manager.add_subscription_on_all_relays(subscription_id, filters)
+        logger.info(f"ボット稼働開始 (Pubkey: {self.private_key.public_key.bech32()})")
 
-        while relay_manager.message_pool.has_events():
-            event_msg = relay_manager.message_pool.get_event()
+    def start(self):
+        """メインループ"""
+        self.setup_relays()
 
-            if event_msg.event.id in messages_done:
-                continue
+        while True:
+            try:
+                # 1. スリープ判定
+                if self.is_sleep_time():
+                    logger.info("稼働時間外のため待機中...")
+                    time.sleep(600)
+                    continue
 
-            # 自分の投稿（定期投稿など）には反応しない
-            if event_msg.event.pubkey == private_key.public_key.hex():
-                continue
+                # 2. 定期投稿
+                now_ts = time.time()
+                if now_ts - self.last_post_time >= self.post_interval:
+                    import random
+                    theme = random.choice([t.strip() for t in prompts.themes.split(",") if t.strip()])
+                    content = self.generate_response("", theme=theme, is_autonomous=True)
 
-            messages_done.append(event_msg.event.id)
-            recipient_pubkey = event_msg.event.pubkey
+                    if content:
+                        note = Event(content=content, kind=EventKind.TEXT_NOTE)
+                        note.sign(self.private_key.hex())
+                        self.relay_manager.publish_event(note)
+                        logger.info(f"定期投稿完了: {content[:20]}...")
 
-            # 公開メンション
-            if event_msg.event.kind == EventKind.TEXT_NOTE:
-                content = event_msg.event.content
-                print(f"メンション受信: {content[:30]}")
-                clean_content = re.sub(r'\b(nostr:)?(nprofile|npub)[0-9a-z]+[\s]*', '', content)
-                reply = Event(content=respond(clean_content))
-                reply.add_event_ref(event_msg.event.id)
-                reply.add_pubkey_ref(event_msg.event.pubkey)
-                reply.sign(private_key.hex())
-                relay_manager.publish_event(reply)
+                    self.last_post_time = now_ts
 
-            gc.collect()
+                # 3. メンション反応
+                self.relay_manager.run_sync()
+                while self.relay_manager.message_pool.has_events():
+                    event_msg = self.relay_manager.message_pool.get_event()
+                    event = event_msg.event
 
-        time.sleep(10)
-        relay_manager.close_all_relay_connections()
+                    if event.id in self.messages_done or event.pubkey == self.pubkey_hex:
+                        continue
+
+                    self.messages_done.add(event.id)
+
+                    # 公開メンションへの返信
+                    if event.kind == EventKind.TEXT_NOTE:
+                        # npub等の除去
+                        clean_content = re.sub(r'\b(nostr:)?(nprofile|npub)[0-9a-z]+[\s]*', '', event.content)
+                        logger.info(f"メンション受信: {clean_content[:30]}")
+
+                        reply_text = self.generate_response(clean_content)
+                        if reply_text:
+                            reply = Event(content=reply_text)
+                            reply.add_event_ref(event.id)
+                            reply.add_pubkey_ref(event.pubkey)
+                            reply.sign(self.private_key.hex())
+                            self.relay_manager.publish_event(reply)
+
+                # 4. 少し待機してリソース節約
+                time.sleep(5)
+                gc.collect()
+
+            except Exception as e:
+                logger.error(f"ループ内でエラー発生: {e}")
+                time.sleep(10)
+                # 接続エラーの可能性もあるためリレーを再セットアップ
+                try:
+                    self.setup_relays()
+                except:
+                    pass
 
 
-try:
-    run()
-except KeyboardInterrupt:
-    print("停止しました")
-    relay_manager.close_all_relay_connections()
-    exit(0)
-except Exception as e:
-    print(f"エラー再起動中: {e}")
-    time.sleep(10)
-    run()
+if __name__ == "__main__":
+    bot = NostrBot()
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        logger.info("停止しました")
+        bot.relay_manager.close_all_relay_connections()
