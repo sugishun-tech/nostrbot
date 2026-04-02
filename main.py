@@ -33,9 +33,9 @@ def system_message():
     return prompts.system.format(cds=cds)
 
 
-def respond(message, theme=None, is_autonomous=False):
+def respond(message, theme1=None, theme2=None, is_autonomous=False):
     if is_autonomous:
-        prompt = prompts.prompt.format(theme=theme)
+        prompt = prompts.prompt.format(theme1=theme1, theme2=theme2)
     else:
         # 返信用
         prompt = message
@@ -94,8 +94,10 @@ def run():
             print("定期投稿を送信中...")
             random.seed(time.time())
             themes = prompts.themes
-            theme = random.choice([t.strip() for t in themes.split(",") if t.strip()])
-            post_content = respond("", theme=theme, is_autonomous=True)
+            theme1 = random.choice(themes)
+            random.seed(time.time())
+            theme2 = random.choice(themes)
+            post_content = respond("", theme1=theme1, theme2=theme2, is_autonomous=True)
             note = Event(content=post_content, kind=EventKind.TEXT_NOTE)
             note.sign(private_key.hex())
 
