@@ -39,7 +39,7 @@ def respond(message, theme1=None, theme2=None, is_autonomous=False):
     else:
         # 返信用
         prompt = message
-        print(prompt)
+    print(prompt)
     messages = [
         {"role": "system", "content": system_message()},
         {"role": "user", "content": prompt}
